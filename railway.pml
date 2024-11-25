@@ -22,6 +22,42 @@ chan signal_to_train[TRAIN_COUNT] = [2] of {mtype:signal_command, int};
 // Signal information, signal id, train id (optional)
 chan signal_to_signal[STATION_COUNT] = [4] of {mtype:signal_information, int, int};
 
+//#region LTL
+
+// https://spinroot.com/spin/Man/ltl.html
+// NOTE: Wording of 'First' refers to index 0.
+// NOTE2: LTL check only works with 4 trains and 4 stations...
+
+// If train0 is waiting to enter in the station1, it will eventually enter the station.
+ltl first_train_eventually_enter_next_station { 
+    eventually (
+        (trains_state[0] == APPROACHING && trains_station[0] == 1) 
+        until
+        (trains_state[0] == STOPPED)
+    ) 
+}
+
+// Always happens that some time in the future train1 will enter station3.
+ltl second_train_always_eventually_enter_fourth_station { 
+    always eventually (trains_station[1] == 3)
+}
+
+// Always eventually happens that train1 will be eventually in a station with an index small tahn the station in which train 4 is stopped;
+// (Assumption: Train4 needs to be stopped, but train1 doesn't need to be)
+ltl second_train_always_eventually_in_station_before_fourth_train { 
+    always eventually (
+        trains_station[1] < trains_station[3] 
+        && trains_state[3] == STOPPED
+    ) 
+}
+
+// Always eventually happens that all trains will be stopped in some station.
+ltl all_trains_always_eventually_stop { 
+    always eventually (trains_state[0] == STOPPED && trains_state[1] == STOPPED && trains_state[2] == STOPPED && trains_state[3] == STOPPED)
+}
+
+//#endregion
+
 proctype signal(int id; chan signal_next_station; chan signal_previous_station) {
     printf("Process %d for station %d.\n", _pid, id);
 
@@ -192,38 +228,35 @@ proctype train(int id){
 }
  
 init {
+    // Cannot perform LTL checks with less than 4 train/stations...
     assert(TRAIN_COUNT > 0);
     assert(STATION_COUNT > 0);
     assert(STATION_COUNT >= TRAIN_COUNT);
 
-    if
-    :: (TRAIN_COUNT == 0 || STATION_COUNT == 0) -> skip;
-    :: else -> 
-        // Init all stations to have no trains in buffer.
-        int i;
+    // Init all stations to have no trains in buffer.
+    int i;
+    for (i : 0 .. STATION_COUNT-1) {
+        station_approaching_train[i] = -1;
+    }
+
+    // Init all trains to be stopped in a different station in ascending order.
+    for (i : 0 .. TRAIN_COUNT-1) {
+        trains_state[i] = STOPPED;
+        trains_station[i] = i;
+        station_occupied_train[i] = i;
+    }
+
+
+    atomic {
         for (i : 0 .. STATION_COUNT-1) {
-            station_approaching_train[i] = -1;
+            if
+            :: i < TRAIN_COUNT -> run train(i);
+            :: else -> skip;
+            fi
+            int next_station_id = (i + 1) % STATION_COUNT;
+            int prev_station_id = (i - 1 + STATION_COUNT) % STATION_COUNT;
+            printf("DEBUG :: Station %d, Next %d, Prev %d.\n", i, next_station_id, prev_station_id);
+            run signal(i, signal_to_signal[next_station_id], signal_to_signal[prev_station_id]);
         }
-
-        // Init all trains to be stopped in a different station in ascending order.
-        for (i : 0 .. TRAIN_COUNT-1) {
-            trains_state[i] = STOPPED;
-            trains_station[i] = i;
-            station_occupied_train[i] = i;
-        }
-
-
-        atomic {
-            for (i : 0 .. STATION_COUNT-1) {
-                if
-                :: i < TRAIN_COUNT -> run train(i);
-                :: else -> skip;
-                fi
-                int next_station_id = (i + 1) % STATION_COUNT;
-                int prev_station_id = (i - 1 + STATION_COUNT) % STATION_COUNT;
-                printf("DEBUG :: Station %d, Next %d, Prev %d.\n", i, next_station_id, prev_station_id);
-                run signal(i, signal_to_signal[next_station_id], signal_to_signal[prev_station_id]);
-            }
-        }
-    fi;
+    }
 }
