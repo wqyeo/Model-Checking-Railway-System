@@ -7,6 +7,7 @@ mtype:signal_command = {WAIT_APPROACHING, STOP_IN_STATION, DEPART};
 mtype:signal_information = {BUFFER_FULL, BUFFER_EMPTY, QUERY_BUFFER};
 
 mtype:train_state trains_state[TRAIN_COUNT];
+
 // ID of Station the train's state is targeted towards.
 int trains_station[TRAIN_COUNT];
 
@@ -19,7 +20,7 @@ int station_occupied_train[STATION_COUNT];
 chan train_to_signal[STATION_COUNT] = [2] of {mtype:train_state, int};
 // Signal command, signal id
 chan signal_to_train[TRAIN_COUNT] = [2] of {mtype:signal_command, int};
-// Signal information, signal id, train id (optional)
+// Signal information, signal id, train id
 chan signal_to_signal[STATION_COUNT] = [4] of {mtype:signal_information, int, int};
 
 //#region LTL
@@ -28,6 +29,7 @@ chan signal_to_signal[STATION_COUNT] = [4] of {mtype:signal_information, int, in
 // NOTE: Wording of 'First' refers to index 0.
 // NOTE2: LTL check only works with 4 trains and 4 stations...
 
+// NOTE: p1
 // If train0 is waiting to enter in the station1, it will eventually enter the station.
 ltl first_train_eventually_enter_next_station { 
     eventually (
@@ -37,27 +39,103 @@ ltl first_train_eventually_enter_next_station {
     ) 
 }
 
+// NOTE: p2
 // Always happens that some time in the future train1 will enter station3.
 ltl second_train_always_eventually_enter_fourth_station { 
     always eventually (trains_station[1] == 3)
 }
 
+
+// NOTE: p3
 // Always eventually happens that train1 will be eventually in a station with an index small tahn the station in which train 4 is stopped;
 // (Assumption: Train4 needs to be stopped, but train1 doesn't need to be)
 ltl second_train_always_eventually_in_station_before_fourth_train { 
     always eventually (
-        trains_station[1] < trains_station[3] 
-        && trains_state[3] == STOPPED
+        trains_station[1] < trains_station[3] &&
+        (trains_state[3] == STOPPED || trains_state[3] == READY_TO_DEPART)
     ) 
 }
 
+// NOTE: p4
 // Always eventually happens that all trains will be stopped in some station.
+// NOTE: Ready to depart is same as being stopped in the station. (Just held up from leaving)
 ltl all_trains_always_eventually_stop { 
-    always eventually (trains_state[0] == STOPPED && trains_state[1] == STOPPED && trains_state[2] == STOPPED && trains_state[3] == STOPPED)
+    always eventually (
+        (trains_state[0] == STOPPED || trains_state[0] == READY_TO_DEPART) &&
+        (trains_state[1] == STOPPED || trains_state[1] == READY_TO_DEPART) &&
+        (trains_state[2] == STOPPED || trains_state[2] == READY_TO_DEPART) &&
+        (trains_state[3] == STOPPED || trains_state[3] == READY_TO_DEPART)
+    )
+}
+
+// NOTE: p5
+// Never can happen that two trains are in the same station in either transit or approaching states.
+active proctype assert_never_two_trains_in_same_station_approaching_transit() {
+    int i, j;
+    end_assert:
+    do
+    ::
+        i = 0;
+        do
+        :: i < TRAIN_COUNT ->
+            j = 0;
+            do
+            :: j < TRAIN_COUNT ->
+                if
+                :: j == i ->
+                    // Skip same train comparison
+                    skip;
+                :: else ->
+                    // NOT: 2 trains in targetting station, and they are both approaching/transit.
+                    assert(!(
+                        trains_station[i] == trains_station[j] 
+                        && (trains_state[i] == APPROACHING || trains_state[i] == IN_TRANSIT) && 
+                        (trains_state[j] == APPROACHING || trains_state[j] == IN_TRANSIT)
+                    ))
+                fi;
+                j++;
+            :: else ->
+                break;
+            od;
+            i++;
+        :: else ->
+            break;
+        od;
+    od;
 }
 
 //#endregion
 
+/**
+Infinite loop that on each cycle, does
+    - Handle train messages (channel)
+    - Handle signal messages (channel)
+Note that cycle is blocking if both channel is empty (no messages), until a message appears.
+
+## Handling Train message:
+Only handles train state for 'Ready to depart' and 'Approaching'.
+
+If a train is ready to depart, it will just query the next signal for it's buffer status (empty/full).
+
+If a train is approaching, it will check if itself has space for the train to dock in station.
+If so, it will let the train dock into the station, otherwise it will just hold up the train.
+
+## Handling Signal Messages
+Only handles incoming signal for Empty Buffer or Query Buffer.
+
+If a signal (usaually previous) is querying it's buffer status,
+it will reply back with a status of EMPTY/FULL.
+    - EMPTY: No train approaching/transit on self.
+    - FULL: A train approaching/transit on self.
+Additionally, if its FULL, it will store in memory that the previous signal
+was awaiting for an empty slot in it's buffer.
+
+If a signal replied back to self with Empty Buffer, it will:
+    1. Send the currently ready to depart train to next station.
+    2. Bring any currently approaching train to dock into self station.
+    3. If previous signal was awaiting for an empty slot in it's buffer,
+    it will send to the previous signal that it is now EMPTY.
+ */
 proctype signal(int id; chan signal_next_station; chan signal_previous_station) {
     printf("Process %d for station %d.\n", _pid, id);
 
@@ -167,6 +245,28 @@ proctype signal(int id; chan signal_next_station; chan signal_previous_station) 
     od
 }
 
+/**
+State machine update logic.
+
+On each cycle,
+
+## Train state is STOPPED (docked in station)
+Immediately switch to being ready to depart,
+inform current station that it wants to depart..
+
+## Train state is Ready to depart
+Await any signal from current station. If its a depart signal, depart immediately.
+(Proceed to transit state)
+
+## Train state is Transit
+Immediately switch to approaching state,
+inform current station that it is approaching.
+
+## Train state is Approaching
+Await any signal from current station.
+If its a stop (dock) signal, dock into current station
+(Switch to STOPPED state)
+ */
 proctype train(int id){
     printf("Process %d for train %d.\n", _pid, id);
     do
@@ -205,12 +305,10 @@ proctype train(int id){
                 fi
             }
         :: curr_train_state == IN_TRANSIT ->
-            atomic {
-                // Train is already in transit, start signalling approaching instead.
-                trains_state[id] = APPROACHING;
-                printf("Train %d relaying approach information to Signal %d.\n", id, curr_target_station);
-                train_to_signal[curr_target_station] ! APPROACHING, id;
-            }
+            // Train is already in transit, start signalling approaching instead.
+            trains_state[id] = APPROACHING;
+            printf("Train %d relaying approach information to Signal %d.\n", id, curr_target_station);
+            train_to_signal[curr_target_station] ! APPROACHING, id;
         :: curr_train_state == APPROACHING ->
             // In a station's buffer, recieve command to wait/enter.
             signal_to_train[id] ? command, sender_signal_id;
@@ -228,9 +326,8 @@ proctype train(int id){
 }
  
 init {
-    // Cannot perform LTL checks with less than 4 train/stations...
     assert(TRAIN_COUNT > 0);
-    assert(STATION_COUNT > 0);
+    assert(STATION_COUNT > 1);
     assert(STATION_COUNT >= TRAIN_COUNT);
 
     // Init all stations to have no trains in buffer.
